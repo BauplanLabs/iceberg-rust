@@ -39,7 +39,7 @@ use crate::to_datafusion_error;
 /// Manages the scanning process of an Iceberg [`Table`], encapsulating the
 /// necessary details and computed properties required for execution planning.
 #[derive(Debug)]
-pub(crate) struct IcebergTableScan {
+pub struct IcebergTableScan {
     /// A table in the catalog.
     table: Table,
     /// Snapshot of the table to scan.
@@ -77,6 +77,26 @@ impl IcebergTableScan {
             projection,
             predicates,
         }
+    }
+
+    /// Returns a reference to the table.
+    pub fn table(&self) -> &Table {
+        &self.table
+    }
+
+    /// Returns the snapshot ID.
+    pub fn snapshot_id(&self) -> Option<i64> {
+        self.snapshot_id
+    }
+
+    /// Returns a reference to the projection column names.
+    pub fn projection(&self) -> Option<Vec<String>> {
+        self.projection.clone()
+    }
+
+    /// Returns a reference to the predicates.
+    pub fn predicate(&self) -> Option<Predicate> {
+        self.predicates.clone()
     }
 
     /// Computes [`PlanProperties`] used in query optimization.
