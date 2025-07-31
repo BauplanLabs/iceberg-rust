@@ -405,6 +405,8 @@ fn reverse_predicate_operator(op: PredicateOperator) -> PredicateOperator {
 }
 
 const MILLIS_PER_DAY: i64 = 24 * 60 * 60 * 1000;
+const MICROS_PER_SECOND: i64 = 1_000_000;
+const MICROS_PER_MILLISECOND: i64 = 1_000;
 
 /// Convert a scalar value to an iceberg datum.
 fn scalar_value_to_datum(value: &ScalarValue) -> Option<Datum> {
@@ -422,14 +424,28 @@ fn scalar_value_to_datum(value: &ScalarValue) -> Option<Datum> {
         ScalarValue::LargeBinary(Some(v)) => Some(Datum::binary(v.clone())),
         ScalarValue::Date32(Some(v)) => Some(Datum::date(*v)),
         ScalarValue::Date64(Some(v)) => Some(Datum::date((*v / MILLIS_PER_DAY) as i32)),
-        // Timestamp conversions
-        // Note: TimestampSecond and TimestampMillisecond are not handled here because
-        // DataFusion's type coercion always converts them to match the column type
-        // (either TimestampMicrosecond or TimestampNanosecond) before predicate pushdown.
-        // See unit tests for how those conversions would work if needed.
-        ScalarValue::TimestampMicrosecond(Some(v), _) => Some(Datum::timestamp_micros(*v)),
-        ScalarValue::TimestampNanosecond(Some(v), _) => Some(Datum::timestamp_nanos(*v)),
+        ScalarValue::TimestampSecond(Some(v), tz) => {
+            interpret_timestamptz_micros(v.checked_mul(MICROS_PER_SECOND)?, tz.as_deref())
+        }
+        ScalarValue::TimestampMillisecond(Some(v), tz) => {
+            interpret_timestamptz_micros(v.checked_mul(MICROS_PER_MILLISECOND)?, tz.as_deref())
+        }
+        ScalarValue::TimestampMicrosecond(Some(v), tz) => {
+            interpret_timestamptz_micros(*v, tz.as_deref())
+        }
+        ScalarValue::TimestampNanosecond(Some(v), Some(_)) => Some(Datum::timestamptz_nanos(*v)),
+        ScalarValue::TimestampNanosecond(Some(v), None) => Some(Datum::timestamp_nanos(*v)),
         _ => None,
+    }
+}
+
+fn interpret_timestamptz_micros(micros: i64, tz: Option<impl AsRef<str>>) -> Option<Datum> {
+    // We care whether the timezone is present, so that we can construct the
+    // right iceberg type (timestamp vs timestamptz). However, there's no
+    // support for storing the timezone itself in the `Datum`.
+    match tz {
+        Some(_) => Some(Datum::timestamptz_micros(micros)),
+        None => Some(Datum::timestamp_micros(micros)),
     }
 }
 
@@ -437,10 +453,13 @@ fn scalar_value_to_datum(value: &ScalarValue) -> Option<Datum> {
 mod tests {
     use std::collections::HashMap;
 
+    use chrono::DateTime;
     use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use datafusion::common::DFSchema;
     use datafusion::logical_expr::utils::split_conjunction;
+    use datafusion::logical_expr::{Operator, binary_expr, col, lit};
     use datafusion::prelude::{Expr, SessionContext};
+    use datafusion::scalar::ScalarValue;
     use iceberg::expr::{Predicate, Reference};
     use iceberg::spec::Datum;
     use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
@@ -463,6 +482,42 @@ mod tests {
             Field::new("qux", DataType::Float64, true).with_metadata(HashMap::from([(
                 PARQUET_FIELD_ID_META_KEY.to_string(),
                 "4".to_string(),
+            )])),
+            Field::new(
+                "ts_ms",
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                true,
+            )
+            .with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "5".to_string(),
+            )])),
+            Field::new(
+                "ts_us",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                true,
+            )
+            .with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "6".to_string(),
+            )])),
+            Field::new(
+                "ts_ns",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                true,
+            )
+            .with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "7".to_string(),
+            )])),
+            Field::new(
+                "ts_tz",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                true,
+            )
+            .with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "8".to_string(),
             )])),
         ]);
         DFSchema::try_from_qualified_schema("my_table", &arrow_schema).unwrap()
@@ -650,39 +705,75 @@ mod tests {
     }
 
     #[test]
-    fn test_scalar_value_to_datum_timestamp() {
-        use datafusion::common::ScalarValue;
+    fn test_predicate_conversion_with_timestamp() {
+        // 2023-01-01 12:00:00 UTC
+        let timestamp_scalar = ScalarValue::TimestampSecond(Some(1672574400), None);
+        let dt = DateTime::parse_from_rfc3339("2023-01-01T12:00:00+00:00").unwrap();
 
-        // Test TimestampMicrosecond - maps directly to Datum::timestamp_micros
-        let ts_micros = 1672876800000000i64; // 2023-01-05 00:00:00 UTC in microseconds
-        let datum =
-            super::scalar_value_to_datum(&ScalarValue::TimestampMicrosecond(Some(ts_micros), None));
-        assert_eq!(datum, Some(Datum::timestamp_micros(ts_micros)));
+        let expr = binary_expr(col("ts"), Operator::Gt, lit(timestamp_scalar));
+        let exprs: Vec<Expr> = split_conjunction(&expr).into_iter().cloned().collect();
+        let predicate = convert_filters_to_predicate(&exprs[..]).unwrap();
+        let expected_predicate =
+            Reference::new("ts").greater_than(Datum::timestamp_from_datetime(dt.naive_utc()));
+        assert_eq!(predicate, expected_predicate);
+    }
 
-        // Test TimestampNanosecond - maps to Datum::timestamp_nanos to preserve precision
-        let ts_nanos = 1672876800000000500i64; // 2023-01-05 00:00:00.000000500 UTC in nanoseconds
-        let datum =
-            super::scalar_value_to_datum(&ScalarValue::TimestampNanosecond(Some(ts_nanos), None));
-        assert_eq!(datum, Some(Datum::timestamp_nanos(ts_nanos)));
+    #[test]
+    fn test_predicate_conversion_with_timestamp_milliseconds() {
+        // 2023-01-01 12:00:00 UTC
+        let timestamp_scalar = ScalarValue::TimestampMillisecond(Some(1672574400000), None);
+        let dt = DateTime::parse_from_rfc3339("2023-01-01T12:00:00+00:00").unwrap();
 
-        // Test None timestamp
-        let datum = super::scalar_value_to_datum(&ScalarValue::TimestampMicrosecond(None, None));
-        assert_eq!(datum, None);
+        let expr = binary_expr(col("ts_ms"), Operator::LtEq, lit(timestamp_scalar));
+        let exprs: Vec<Expr> = split_conjunction(&expr).into_iter().cloned().collect();
+        let predicate = convert_filters_to_predicate(&exprs[..]).unwrap();
+        let expected_predicate = Reference::new("ts_ms")
+            .less_than_or_equal_to(Datum::timestamp_from_datetime(dt.naive_utc()));
+        assert_eq!(predicate, expected_predicate);
+    }
 
-        // Note: TimestampSecond and TimestampMillisecond are not supported because
-        // DataFusion's type coercion converts them to TimestampMicrosecond or TimestampNanosecond
-        // before they reach scalar_value_to_datum in SQL queries.
-        //
-        // These return None (not pushed down):
-        let ts_seconds = 1672876800i64; // 2023-01-05 00:00:00 UTC in seconds
-        let datum =
-            super::scalar_value_to_datum(&ScalarValue::TimestampSecond(Some(ts_seconds), None));
-        assert_eq!(datum, None);
+    #[test]
+    fn test_predicate_conversion_with_timestamp_nanoseconds() {
+        // 2023-01-01 12:00:00 UTC
+        let timestamp_scalar = ScalarValue::TimestampNanosecond(Some(1672574400000000000), None);
+        let dt = DateTime::parse_from_rfc3339("2023-01-01T12:00:00+00:00").unwrap();
 
-        let ts_millis = 1672876800000i64; // 2023-01-05 00:00:00 UTC in milliseconds
-        let datum =
-            super::scalar_value_to_datum(&ScalarValue::TimestampMillisecond(Some(ts_millis), None));
-        assert_eq!(datum, None);
+        let expr = binary_expr(col("ts_ns"), Operator::NotEq, lit(timestamp_scalar));
+        let exprs: Vec<Expr> = split_conjunction(&expr).into_iter().cloned().collect();
+        let predicate = convert_filters_to_predicate(&exprs[..]).unwrap();
+        let expected_predicate = Reference::new("ts_ns")
+            .not_equal_to(Datum::timestamp_nanos(dt.timestamp_nanos_opt().unwrap()));
+        assert_eq!(predicate, expected_predicate);
+    }
+
+    #[test]
+    fn test_predicate_conversion_with_timestamp_with_timezone() {
+        // 2023-01-01 13:00:00 +01:00
+        let timestamp_scalar =
+            ScalarValue::TimestampSecond(Some(1672574400), Some("+01:00".into()));
+        let dt = DateTime::parse_from_rfc3339("2023-01-01T13:00:00+01:00").unwrap();
+
+        let expr = binary_expr(col("ts_tz"), Operator::GtEq, lit(timestamp_scalar));
+        let exprs: Vec<Expr> = split_conjunction(&expr).into_iter().cloned().collect();
+        let predicate = convert_filters_to_predicate(&exprs[..]).unwrap();
+        let expected_predicate =
+            Reference::new("ts_tz").greater_than_or_equal_to(Datum::timestamptz_from_datetime(dt));
+        assert_eq!(predicate, expected_predicate);
+    }
+
+    #[test]
+    fn test_predicate_conversion_with_timestamp_nanoseconds_with_timezone() {
+        // 2023-01-01 13:00:00 +01:00
+        let timestamp_scalar =
+            ScalarValue::TimestampNanosecond(Some(1672574400000000000), Some("+01:00".into()));
+        let dt = DateTime::parse_from_rfc3339("2023-01-01T13:00:00+01:00").unwrap();
+
+        let expr = binary_expr(col("ts_tz"), Operator::GtEq, lit(timestamp_scalar));
+        let exprs: Vec<Expr> = split_conjunction(&expr).into_iter().cloned().collect();
+        let predicate = convert_filters_to_predicate(&exprs[..]).unwrap();
+        let expected_predicate = Reference::new("ts_tz")
+            .greater_than_or_equal_to(Datum::timestamptz_nanos(dt.timestamp_nanos_opt().unwrap()));
+        assert_eq!(predicate, expected_predicate);
     }
 
     #[test]
@@ -704,8 +795,6 @@ mod tests {
     fn test_predicate_conversion_with_binary() {
         let sql = "foo = 1 and bar = X'0102'";
         let predicate = convert_to_iceberg_predicate(sql).unwrap();
-        // Binary literals are converted to Datum::binary
-        // Note: SQL literal 1 is converted to Long by DataFusion
         let expected_predicate = Reference::new("foo")
             .equal_to(Datum::long(1))
             .and(Reference::new("bar").equal_to(Datum::binary(vec![1u8, 2u8])));
@@ -716,15 +805,12 @@ mod tests {
     fn test_scalar_value_to_datum_boolean() {
         use datafusion::common::ScalarValue;
 
-        // Test boolean true
         let datum = super::scalar_value_to_datum(&ScalarValue::Boolean(Some(true)));
         assert_eq!(datum, Some(Datum::bool(true)));
 
-        // Test boolean false
         let datum = super::scalar_value_to_datum(&ScalarValue::Boolean(Some(false)));
         assert_eq!(datum, Some(Datum::bool(false)));
 
-        // Test None boolean
         let datum = super::scalar_value_to_datum(&ScalarValue::Boolean(None));
         assert_eq!(datum, None);
     }
@@ -761,7 +847,6 @@ mod tests {
 
     #[test]
     fn test_predicate_conversion_with_like_complex_pattern() {
-        // Patterns with wildcards in the middle cannot be pushed down
         let sql = "bar LIKE 'te%st'";
         let predicate = convert_to_iceberg_predicate(sql);
         assert_eq!(predicate, None);
@@ -769,7 +854,6 @@ mod tests {
 
     #[test]
     fn test_predicate_conversion_with_like_underscore_wildcard() {
-        // Patterns with underscore wildcard cannot be pushed down
         let sql = "bar LIKE 'test_'";
         let predicate = convert_to_iceberg_predicate(sql);
         assert_eq!(predicate, None);
@@ -777,7 +861,6 @@ mod tests {
 
     #[test]
     fn test_predicate_conversion_with_like_no_wildcard() {
-        // Patterns without trailing % cannot be pushed down as StartsWith
         let sql = "bar LIKE 'test'";
         let predicate = convert_to_iceberg_predicate(sql);
         assert_eq!(predicate, None);
@@ -785,7 +868,6 @@ mod tests {
 
     #[test]
     fn test_predicate_conversion_with_ilike() {
-        // Case-insensitive LIKE (ILIKE) is not supported
         let sql = "bar ILIKE 'test%'";
         let predicate = convert_to_iceberg_predicate(sql);
         assert_eq!(predicate, None);
@@ -804,16 +886,13 @@ mod tests {
 
     #[test]
     fn test_predicate_conversion_with_like_special_characters() {
-        // Test LIKE with special characters in prefix
         let sql = "bar LIKE 'test-abc_123%'";
         let predicate = convert_to_iceberg_predicate(sql);
-        // This should not be pushed down because it contains underscore
         assert_eq!(predicate, None);
     }
 
     #[test]
     fn test_predicate_conversion_with_like_unicode() {
-        // Test LIKE with unicode characters in prefix
         let sql = "bar LIKE '测试%'";
         let predicate = convert_to_iceberg_predicate(sql).unwrap();
         assert_eq!(
